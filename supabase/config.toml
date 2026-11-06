@@ -1,0 +1,2 @@
+[functions.search-photos]
+verify_jwt = true
