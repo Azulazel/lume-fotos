@@ -1,3 +1,5 @@
+import {compressPhoto} from './compression.js';
+import {processPipeline} from './upload-utils.js';
 let authToken=sessionStorage.getItem('lume-oracle-token')||'';
 async function api(path,method='GET',body){const headers={};if(authToken)headers.Authorization='Bearer '+authToken;if(body && !(body instanceof FormData))headers['Content-Type']='application/json';const response=await fetch(window.LUME_CONFIG.apiUrl+path,{method,headers,body:body?(body instanceof FormData?body:JSON.stringify(body)):undefined});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'Não foi possível concluir a operação.');return data;}
 const $ = (id) => document.getElementById(id);
@@ -81,7 +83,7 @@ function renderResults(photos) {
   $('result-description').textContent=photos.length?'Confira as sugestões. Os links ficam disponíveis por 10 minutos; depois, faça uma nova busca.':'Tente uma selfie mais nítida ou confira se escolheu o evento certo. O fotógrafo também pode estar enviando novas fotos.';
   $('photo-grid').replaceChildren();
   for(const photo of photos){
-    const card=document.createElement('article');card.className='result-photo';const img=document.createElement('img');img.src=photo.url;img.alt='Foto encontrada no evento';img.loading='lazy';
+    const card=document.createElement('article');card.className='result-photo';const img=document.createElement('img');img.src=photo.url+'&thumb=1';img.alt='Foto encontrada no evento';img.loading='lazy';
     const actions=document.createElement('div');actions.className='photo-actions';const label=document.createElement('span');label.textContent=photo.name;
     const link=document.createElement('a');link.href=photo.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Abrir / baixar ↗';
     actions.append(label,link);card.append(img,actions);$('photo-grid').append(card);
@@ -100,7 +102,7 @@ $('open-camera').onclick=async()=>{
 $('close-camera').onclick=()=>{$('camera-dialog').close();stopCamera();};$('camera-dialog').addEventListener('close',stopCamera);
 $('capture').onclick=async()=>{const v=$('camera-video');if(!v.videoWidth)return;const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);const blob=await new Promise(resolve=>c.toBlob(resolve,'image/jpeg',.92));stopCamera();$('camera-dialog').close();if(blob)await search(new File([blob],'selfie.jpg',{type:'image/jpeg'}));};
 window.addEventListener('pagehide',()=>{stopCamera();clearSearch();});
-$('login-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;try{setStatus('login-status','Entrando…');setStatus('login-status','Entrando… No primeiro acesso, seus eventos e fotos serão transferidos para a Oracle. Aguarde e mantenha esta página aberta.');const result=await api('/auth/login','POST',{email:$('email').value.trim(),password:$('password').value});authToken=result.token;sessionStorage.setItem('lume-oracle-token',authToken);$('password').value='';await refreshAdmin();}catch(e){setStatus('login-status',e.message,true);}finally{button.disabled=false;}};
+$('login-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;try{setStatus('login-status','Entrando…');setStatus('login-status','Entrando…');const result=await api('/auth/login','POST',{email:$('email').value.trim(),password:$('password').value});authToken=result.token;sessionStorage.setItem('lume-oracle-token',authToken);$('password').value='';await refreshAdmin();}catch(e){setStatus('login-status',e.message,true);}finally{button.disabled=false;}};
 async function refreshAdmin(){
  let isAdmin=false;if(authToken){try{await api('/auth/me');isAdmin=true;}catch{authToken='';sessionStorage.removeItem('lume-oracle-token');}}
  $('login-panel').hidden=isAdmin;$('dashboard').hidden=!isAdmin;
@@ -124,24 +126,26 @@ $('close-upload').onclick=()=>{if(!uploading)$('upload-panel').hidden=true;};
 $('batch-files').onchange=async e=>{
  const files=Array.from(e.target.files);e.target.value='';if(!files.length||uploading)return;
  if(!$('upload-consent').checked){setStatus('upload-status','Confirme a autorização antes de enviar as fotos.',true);return;}
- const event=selectedEvent;uploading=true;$('batch-files').disabled=true;$('close-upload').disabled=true;$('upload-progress').hidden=false;$('upload-progress').max=files.length;$('upload-progress').value=0;$('upload-log').replaceChildren();let sent=0,failed=0;
- for(let i=0;i<files.length;i++){
- const file=files[i];let storagePath,photoId;
- try{setStatus('upload-status','Analisando e enviando '+(i+1)+' de '+files.length+' · '+file.name);const faces=await describe(file);if(!faces.length)throw new Error('Nenhum rosto detectado; foto não enviada.');
- const form=new FormData();form.append('file',file);form.append('descriptors',JSON.stringify(faces));await api('/admin/events/'+event.id+'/photos','POST',form);
- sent++;addLog(file.name+' — '+faces.length+' rosto(s), enviada.');
- }catch(err){failed++;addLog(file.name+' — '+(err.message||'Falha no envio'),true);}
- $('upload-progress').value=i+1;
- }
- uploading=false;$('batch-files').disabled=false;$('close-upload').disabled=false;setStatus('upload-status','Lote concluído: '+sent+' enviada(s), '+failed+' não enviada(s).',failed>0);
- try{await renderAdminPhotos();}catch(e){setStatus('admin-status',e.message,true);}
+ const event=selectedEvent,mode=$('upload-quality').value;uploading=true;$('batch-files').disabled=true;$('upload-quality').disabled=true;$('close-upload').disabled=true;$('upload-progress').hidden=false;$('upload-progress').max=files.length;$('upload-progress').value=0;$('upload-log').replaceChildren();let sent=0,failed=0,before=0,after=0;const started=performance.now();let preparing='Preparando modelos…';
+ const update=()=>{setStatus('upload-status',(sent+failed)+'/'+files.length+' concluídas · '+sent+' enviadas · '+failed+' falhas · '+preparing);$('upload-progress').value=sent+failed;};
+ update();
+ try{await loadModels();await processPipeline(files,{
+ concurrency:2,
+ prepare:async file=>{preparing='Analisando '+file.name;update();validateImage(file);const compressed=compressPhoto(file,mode);const faces=await describe(file);if(!faces.length){await compressed;throw new Error('Nenhum rosto detectado; foto não enviada.');}const result=await compressed;return {original:file,file:result.file,faces,changed:result.changed};},
+ upload:async item=>{const form=new FormData();form.append('file',item.file);form.append('descriptors',JSON.stringify(item.faces));await api('/admin/events/'+event.id+'/photos','POST',form);},
+ onDone:(file,item)=>{sent++;before+=file.size;after+=item.file.size;addLog(file.name+' — '+item.faces.length+' rosto(s) · '+(item.file.size/1024/1024).toFixed(2)+' MB'+(item.changed?' · reduzida '+Math.round((1-item.file.size/file.size)*100)+'%':' · original preservado'));update();},
+ onError:(file,error)=>{failed++;addLog(file.name+' — '+error.message,true);update();}
+ });}catch(error){setStatus('upload-status',error.message,true);}
+ finally{uploading=false;$('batch-files').disabled=false;$('upload-quality').disabled=false;$('close-upload').disabled=false;}
+ if(sent+failed===files.length){const saved=before?Math.round((1-after/before)*100):0;setStatus('upload-status','Lote concluído em '+Math.round((performance.now()-started)/1000)+'s: '+sent+' enviada(s), '+failed+' falha(s). Transferido '+(after/1024/1024).toFixed(1)+' MB · economia de '+saved+'%.',failed>0);}
+ try{await renderAdminPhotos();}catch(error){setStatus('admin-status',error.message,true);}
 };
 function addLog(message,error=false){const li=document.createElement('li');li.textContent=message;if(error)li.className='error';$('upload-log').append(li);}
 async function renderAdminPhotos(){
  const photos=[];let page;do{page=await api('/admin/events/'+selectedEvent.id+'/photos?offset='+photos.length);photos.push(...page);}while(page.length===100);$('admin-photos').replaceChildren();
  if(!photos.length){$('admin-photos').textContent='Nenhuma foto enviada neste evento.';return;}
 
- for(let i=0;i<photos.length;i++){const p=photos[i];const card=document.createElement('article');card.className='result-photo';const img=document.createElement('img');img.src=p.url;img.alt=p.name;img.loading='lazy';const action=document.createElement('div');action.className='photo-actions';const label=document.createElement('span');label.textContent=p.name+' · '+p.face_count+' rosto(s)';const remove=document.createElement('button');remove.className='text-button';remove.textContent='Excluir';remove.onclick=async()=>{if(uploading||!confirm('Excluir esta foto e seus descritores? Esta ação não pode ser desfeita.'))return;remove.disabled=true;try{await api('/admin/photos/'+p.id,'DELETE');await renderAdminPhotos();}catch(e){setStatus('upload-status',e.message,true);remove.disabled=false;}};action.append(label,remove);card.append(img,action);$('admin-photos').append(card);}
+ for(let i=0;i<photos.length;i++){const p=photos[i];const card=document.createElement('article');card.className='result-photo';const img=document.createElement('img');img.src=p.url+'&thumb=1';img.alt=p.name;img.loading='lazy';const action=document.createElement('div');action.className='photo-actions';const label=document.createElement('span');label.textContent=p.name+' · '+p.face_count+' rosto(s)';const remove=document.createElement('button');remove.className='text-button';remove.textContent='Excluir';remove.onclick=async()=>{if(uploading||!confirm('Excluir esta foto e seus descritores? Esta ação não pode ser desfeita.'))return;remove.disabled=true;try{await api('/admin/photos/'+p.id,'DELETE');await renderAdminPhotos();}catch(e){setStatus('upload-status',e.message,true);remove.disabled=false;}};action.append(label,remove);card.append(img,action);$('admin-photos').append(card);}
 }
 window.addEventListener('beforeunload',e=>{if(uploading){e.preventDefault();e.returnValue='';}});
 async function init(){

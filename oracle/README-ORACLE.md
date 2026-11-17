@@ -28,3 +28,7 @@ backend/test_server.py usa diretório temporário: autenticação, logout, cria�
 ## Rollback
 
 O Supabase original permanece preservado. A versão anterior no GitHub é f63b7bd805a572623652face6872f2e60194a67a. Restaurar app.js, index.html e config.js desse commit volta a apontar para o Supabase. Fotos novas enviadas à Oracle não são automaticamente copiadas de volta.
+
+## Otimização de lotes
+
+JPEG: alta qualidade (até 4000 px, qualidade do codificador 0,94), mais rápido (2560 px, 0,90) ou original. A recompressão é com perdas e remove metadados; a opção original preserva os bytes. PNG e WebP não são alterados. Só é enviada a versão comprimida quando economiza mais de 10%; imagens abaixo de 350 KB são preservadas. A compressão usa Web Worker e OffscreenCanvas; se indisponíveis, mantém o original. O reconhecimento analisa a imagem original. Até dois uploads são executados em paralelo com preparação limitada, e falhas individuais não interrompem o lote. A interface mostra tempo, tamanho enviado e economia real. Miniaturas de 640 px são geradas na Oracle para as grades; abrir/baixar usa a imagem enviada. Testes adicionais: node test-upload.mjs.

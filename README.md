@@ -1,43 +1,38 @@
-# Lume Fotos
+# Lume — backend Oracle
 
-Plataforma de fotografia de eventos: o administrador envia lotes de fotos e os visitantes encontram possíveis fotos suas a partir de uma selfie, escolhida da galeria ou capturada pela câmera.
+Frontend: GitHub Pages. API: https://lume.163.176.48.125.sslip.io/api. Servidor: Ubuntu ARM, 163.176.48.125. A API usa FastAPI, SQLite WAL e NumPy. Os descritores continuam sendo produzidos por face-api.js no navegador; a comparação acontece no servidor, sem enviar ou armazenar a selfie.
 
-## Origem
+## Serviços e dados
 
-Adaptação do fluxo de reconhecimento do [arifszn/find-me](https://github.com/arifszn/find-me), licença MIT, commit 85e47be58c13d218aa48c158809ead4f609975f2. Uma cópia dos fontes originais está em upstream/find-me; a interface e a integração com Supabase foram reimplementadas para suportar eventos, administração e armazenamento privado. A licença original foi preservada. Os modelos vêm do mesmo commit, pelo CDN jsDelivr. face-api.js 0.22.2 é usado somente para detecção, pontos faciais e descritores, sem classificação demográfica.
+- Código: /opt/lume; serviço systemd lume; usuário sem shell lume.
+- SQLite: /var/lib/lume/lume.sqlite; fotos: /var/lib/lume/photos. Nenhum desses diretórios é servido pelo Nginx.
+- Segredos: /etc/lume.env, somente root. Nunca publicar esse arquivo.
+- HTTPS: Nginx + Certbot, renovação automática. DNS gratuito sslip.io depende de manter o IP público atual.
+- Logs: journalctl -u lume. Logs de acesso da API foram desativados para não registrar links assinados. Logs de erro de infraestrutura ainda podem existir.
+- Backups diários do banco: /var/lib/lume/backups, 14 dias. As fotos não são duplicadas. Esses snapshots estão no mesmo disco e NÃO protegem contra perda da VM; configure cópia externa antes de depender do sistema para arquivos insubstituíveis.
 
-## Arquitetura
+## Migração
 
-- Frontend estático no GitHub Pages, sem build.
-- Supabase Auth: login do fotógrafo por e-mail e senha.
-- Postgres + pgvector: eventos, fotos e descritores de 128 dimensões.
-- Storage privado: event-photos; uploads limitados a JPG, PNG e WebP, 15 MB.
-- Edge Function search-photos: busca por distância euclidiana inferior a 0,52, até 100 resultados, URLs assinadas por 10 minutos, limite de 12 consultas/minuto por hash de IP.
-- Fotos e descritores não têm leitura anônima. Somente eventos publicados são listados publicamente. As funções SQL de busca só podem ser chamadas pelo service_role no servidor.
+Enquanto não existe administrador local, o primeiro login aceita somente uma conta que já tenha permissão de admin no Supabase original. O servidor valida a senha com Supabase Auth, copia eventos, fotos privadas e descritores e grava o administrador local com hash PBKDF2-SHA256. Essa cópia é somente leitura na origem. Após o sucesso, login, eventos, uploads e busca usam apenas a Oracle. A senha é a mesma utilizada nesse primeiro acesso. O banco de destino é confirmado em uma transação; falhas não removem dados da origem. Evite novos uploads no Supabase durante a transferência; não há sincronização contínua. Apenas a primeira conta admin é importada.
 
-## Configuração em um projeto novo
+## Segurança e limites
 
-1. Execute supabase/schema.sql no SQL Editor, uma vez.
-2. Crie sua conta em Authentication > Users > Add user no painel Supabase. Defina a senha pessoalmente.
-3. Promova somente seu usuário, substituindo o UUID: INSERT INTO public.admins(user_id) VALUES ('UUID-DO-SEU-USUARIO');
-4. Publique supabase/functions/search-photos/index.ts como Edge Function chamada search-photos. Mantenha Verify JWT ativado e utilize a chave pública legacy anon no frontend (a função recebe consultas públicas, valida o corpo e aplica limite de requisições). SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY são fornecidas pelo ambiente do Supabase; nunca as copie para o frontend.
-5. Preencha config.js com a URL do projeto e a chave pública anon/publishable. Não use chave secreta.
-6. GitHub > Settings > Pages > Deploy from a branch > main > /(root).
+Sessões aleatórias de 12 horas, armazenadas como hashes no banco e sessionStorage no navegador. Limite de login: 6/minuto por IP; busca: 12/minuto. Bucket privado substituído por arquivos privados e links HMAC de 10 minutos. Upload máximo 15 MB por arquivo, 100 rostos por imagem; o disco mantém reserva de 2 GiB. A busca processa descritores em lotes de 1000 e retorna até 100 fotos. Não existe limite comercial de 20 GB: o armazenamento acompanha o disco disponível, descontados sistema, banco e reserva.
 
-## Uso
+Reconhecimento facial não autentica identidade e pode ter falsos positivos. Não use para conteúdo confidencial. Câmera exige HTTPS e autorização do visitante. O painel permite excluir fotos e descritores; exclusão de eventos inteiros ainda não está implementada.
 
-Abra #admin, faça login, crie um evento, confirme a autorização dos participantes e envie várias fotos. Aguarde o lote terminar: a análise é sequencial no navegador do administrador. Fotos sem rostos detectáveis não são enviadas. Confira o relatório individual de falhas. Publique o evento e use Copiar link para divulgar a galeria.
+## Validação
 
-O visitante seleciona o evento, confirma que está buscando suas próprias fotos e escolhe uma imagem com um único rosto ou usa a câmera. A selfie não sai do dispositivo; o descritor é enviado para uma consulta e não é persistido. Limpar minha busca remove a prévia e os resultados da página. As fotos do evento e seus descritores permanecem até exclusão pelo fotógrafo. A exclusão de uma foto também remove seus descritores.
+backend/test_server.py usa diretório temporário: autenticação, logout, criação de evento, upload, publicação, busca positiva/negativa, assinatura de URL, remoção com cascata, imagem inválida e rate limit. Executar: cd backend && /opt/lume/venv/bin/python test_server.py.
 
-## Desenvolvimento
+## Rollback
 
-Node 20+; npm start abre http://127.0.0.1:4173. npm run check valida a sintaxe. Não é necessário instalar dependências para servir o frontend. Dependências e modelos têm versões fixadas em CDN; sua disponibilidade depende de conexão com a internet.
+O Supabase original permanece preservado. A versão anterior no GitHub é f63b7bd805a572623652face6872f2e60194a67a. Restaurar app.js, index.html e config.js desse commit volta a apontar para o Supabase. Fotos novas enviadas à Oracle não são automaticamente copiadas de volta.
 
-## Limites conhecidos
+## Otimização de lotes
 
-A correspondência facial não é autenticação nem prova de identidade; pode falhar com rostos pequenos, iluminação ruim, perfis e pessoas parecidas. Não use para galerias confidenciais ou decisões sobre pessoas. Quem possui uma foto de alguém pode tentar uma busca. URLs assinadas podem ser compartilhadas até expirar. A selfie é descartada, mas as plataformas de infraestrutura podem reter metadados técnicos de requisição. Ajuste política de retenção e atendimento a pedidos de exclusão antes de operar eventos reais. O limite de requisições usa o IP encaminhado pelo gateway e não substitui proteção contra abuso em grande escala. A grade do administrador mostra as 200 fotos mais recentes e a busca retorna até 100 correspondências; grandes eventos precisam de paginação e processamento em servidor. Uploads em segundo plano não sobrevivem ao fechamento da aba.
+JPEG: alta qualidade (até 4000 px, qualidade do codificador 0,94), mais rápido (2560 px, 0,90) ou original. A recompressão é com perdas e remove metadados; a opção original preserva os bytes. PNG e WebP não são alterados. Só é enviada a versão comprimida quando economiza mais de 10%; imagens abaixo de 350 KB são preservadas. A compressão usa Web Worker e OffscreenCanvas; se indisponíveis, mantém o original. O reconhecimento analisa a imagem original. Até dois uploads são executados em paralelo com preparação limitada, e falhas individuais não interrompem o lote. A interface mostra tempo, tamanho enviado e economia real. Miniaturas de 640 px são geradas na Oracle para as grades; abrir/baixar usa a imagem enviada. Testes adicionais: node test-upload.mjs.
 
-## Créditos visuais
+## Projeto original
 
-Fotografias ilustrativas servidas pelo Unsplash. Elas não são resultados de busca nem dados de participantes. Fontes DM Sans e Playfair Display via Google Fonts.
+Fluxo facial adaptado de arifszn/find-me (MIT), commit 85e47be58c13d218aa48c158809ead4f609975f2. Licença e fonte original preservados no repositório.

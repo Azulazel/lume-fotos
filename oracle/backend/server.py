@@ -3,13 +3,14 @@ from pathlib import Path
 from contextlib import contextmanager
 import numpy as np
 import httpx
-from PIL import Image
+from PIL import Image, ImageOps
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 DATA=Path(os.environ.get('LUME_DATA','/var/lib/lume')); DATA.mkdir(parents=True,exist_ok=True)
 PHOTOS=DATA/'photos'; PHOTOS.mkdir(exist_ok=True)
+THUMBS=DATA/'thumbs'; THUMBS.mkdir(exist_ok=True)
 SECRET=os.environ['LUME_SECRET'].encode(); BASE=os.environ.get('PUBLIC_URL','https://lume.163.176.48.125.sslip.io')
 LOCK=threading.RLock()
 @contextmanager
@@ -183,6 +184,7 @@ def delete_photo(id:str,user=Depends(admin)):
   if not p:raise HTTPException(404)
   c.execute('DELETE FROM photos WHERE id=?',(id,))
  (PHOTOS/p['path']).unlink(missing_ok=True)
+ (THUMBS/(id+'.jpg')).unlink(missing_ok=True)
  return {'ok':True}
 @app.post('/api/search')
 def search(body:Search,req:Request):
@@ -203,9 +205,18 @@ def search(body:Search,req:Request):
    if p:result.append({'id':id,'name':p['name'],'url':photo_url(p)})
  return {'photos':result}
 @app.get('/api/media/{id}')
-def media(id:str,expires:int,signature:str):
+def media(id:str,expires:int,signature:str,thumb:bool=False):
  expected=hmac.new(SECRET,(id+':'+str(expires)).encode(),hashlib.sha256).hexdigest()
  if expires<time.time() or expires>time.time()+610 or not hmac.compare_digest(expected,signature):raise HTTPException(403,'Link expirado ou inválido.')
  with connect() as c:p=c.execute('SELECT * FROM photos WHERE id=?',(id,)).fetchone()
  if not p or not (PHOTOS/p['path']).is_file():raise HTTPException(404)
- return FileResponse(PHOTOS/p['path'],filename=p['name'],content_disposition_type='inline')
+ if thumb:
+  target=THUMBS/(id+'.jpg')
+  with LOCK:
+   if not target.exists():
+    with Image.open(PHOTOS/p['path']) as original:
+     image=ImageOps.exif_transpose(original);image.thumbnail((640,640));image=image.convert('RGB')
+     temp=THUMBS/(id+'.'+secrets.token_hex(6)+'.tmp');image.save(temp,format='JPEG',quality=82,optimize=True);temp.replace(target)
+  return FileResponse(target,media_type='image/jpeg')
+ with Image.open(PHOTOS/p['path']) as original:mime=Image.MIME.get(original.format,'application/octet-stream')
+ return FileResponse(PHOTOS/p['path'],filename=p['name'],media_type=mime,content_disposition_type='inline')
