@@ -1,7 +1,8 @@
 import {compressPhoto} from './compression.js';
-import {processPipeline} from './upload-utils.js';
+import {BatchQueue} from './batch-queue.js';
 let authToken=sessionStorage.getItem('lume-oracle-token')||'';
-async function api(path,method='GET',body){const headers={};if(authToken)headers.Authorization='Bearer '+authToken;if(body && !(body instanceof FormData))headers['Content-Type']='application/json';const response=await fetch(window.LUME_CONFIG.apiUrl+path,{method,headers,body:body?(body instanceof FormData?body:JSON.stringify(body)):undefined});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'Não foi possível concluir a operação.');return data;}
+async function api(path,method='GET',body){const headers={};if(authToken)headers.Authorization='Bearer '+authToken;if(body && !(body instanceof FormData))headers['Content-Type']='application/json';const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),180000);let response;try{response=await fetch(window.LUME_CONFIG.apiUrl+path,{method,headers,signal:controller.signal,body:body?(body instanceof FormData?body:JSON.stringify(body)):undefined});}catch(cause){const error=new Error(cause.name==='AbortError'?'O envio demorou demais. Tentando recuperar a conexão.':'Falha de conexão. Confira sua internet.');error.retryable=true;throw error;}finally{clearTimeout(timeout);}const data=await response.json().catch(()=>({}));if(!response.ok){const error=new Error(typeof data.detail==='string'?data.detail:'Não foi possível concluir a operação.');error.status=response.status;error.retryable=response.status>=500;throw error;}return data;}
+
 const $ = (id) => document.getElementById(id);
 const config = window.LUME_CONFIG || {};
 let db, modelPromise, selectedEvent, uploading = false, stream, selfieUrl, searching = false, searchGeneration = 0;
@@ -23,14 +24,11 @@ function validateImage(file) {
   if (file.size > 15 * 1024 * 1024) throw new Error('A imagem deve ter no máximo 15 MB.');
 }
 async function describe(file) {
-  validateImage(file); await loadModels();
-  const img = await faceapi.bufferToImage(file);
-  const ratio = Math.min(1, 1800 / Math.max(img.width,img.height));
-  const canvas = document.createElement('canvas'); canvas.width = Math.round(img.width*ratio); canvas.height = Math.round(img.height*ratio);
-  canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);
-  const detections = await faceapi.detectAllFaces(canvas,new faceapi.SsdMobilenetv1Options({minConfidence:0.5})).withFaceLandmarks().withFaceDescriptors();
-  canvas.width=0;canvas.height=0;
-  return detections.map(d=>Array.from(d.descriptor));
+ validateImage(file);await loadModels();let img,url;const canvas=document.createElement('canvas');
+ try{if(typeof createImageBitmap==='function')img=await createImageBitmap(file,{imageOrientation:'from-image'});else{url=URL.createObjectURL(file);img=await new Promise((resolve,reject)=>{const image=new Image();image.onload=()=>resolve(image);image.onerror=()=>reject(new Error('Não foi possível abrir esta imagem.'));image.src=url;});}
+ const ratio=Math.min(1,1800/Math.max(img.width,img.height));canvas.width=Math.round(img.width*ratio);canvas.height=Math.round(img.height*ratio);canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);img.close?.();img=null;
+ const detections=await faceapi.detectAllFaces(canvas,new faceapi.SsdMobilenetv1Options({minConfidence:.5})).withFaceLandmarks().withFaceDescriptors();return detections.map(d=>Array.from(d.descriptor));
+ }finally{img?.close?.();if(url)URL.revokeObjectURL(url);canvas.width=0;canvas.height=0;}
 }
 async function loadEvents() {
   const list = await api('/events');
@@ -121,32 +119,48 @@ async function renderAdminEvents(){
  actions.append(upload,toggle,share);row.append(info,actions);$('admin-events').append(row);
  }
 }
-async function openUpload(event){if(uploading)throw new Error('Aguarde o lote atual terminar.');selectedEvent=event;$('upload-panel').hidden=false;$('upload-title').textContent=event.name;$('upload-log').replaceChildren();setStatus('upload-status','');await renderAdminPhotos();$('upload-panel').scrollIntoView({behavior:'smooth'});}
+async function openUpload(event){if(uploading)throw new Error('Aguarde o lote atual terminar.');if(selectedEvent?.id!==event.id){batchQueue=null;batchStarted=0;$('batch-controls').hidden=true;}selectedEvent=event;$('upload-panel').hidden=false;$('upload-title').textContent=event.name;$('upload-log').replaceChildren();setStatus('upload-status','');await renderAdminPhotos();$('upload-panel').scrollIntoView({behavior:'smooth'});}
 $('close-upload').onclick=()=>{if(!uploading)$('upload-panel').hidden=true;};
-$('batch-files').onchange=async e=>{
- const files=Array.from(e.target.files);e.target.value='';if(!files.length||uploading)return;
- if(!$('upload-consent').checked){setStatus('upload-status','Confirme a autorização antes de enviar as fotos.',true);return;}
- const event=selectedEvent,mode=$('upload-quality').value;uploading=true;$('batch-files').disabled=true;$('upload-quality').disabled=true;$('close-upload').disabled=true;$('upload-progress').hidden=false;$('upload-progress').max=files.length;$('upload-progress').value=0;$('upload-log').replaceChildren();let sent=0,failed=0,before=0,after=0;const started=performance.now();let preparing='Preparando modelos…';
- const update=()=>{setStatus('upload-status',(sent+failed)+'/'+files.length+' concluídas · '+sent+' enviadas · '+failed+' falhas · '+preparing);$('upload-progress').value=sent+failed;};
- update();
- try{await loadModels();await processPipeline(files,{
- concurrency:2,
- prepare:async file=>{preparing='Analisando '+file.name;update();validateImage(file);const compressed=compressPhoto(file,mode);const faces=await describe(file);if(!faces.length){await compressed;throw new Error('Nenhum rosto detectado; foto não enviada.');}const result=await compressed;return {original:file,file:result.file,faces,changed:result.changed};},
- upload:async item=>{const form=new FormData();form.append('file',item.file);form.append('descriptors',JSON.stringify(item.faces));await api('/admin/events/'+event.id+'/photos','POST',form);},
- onDone:(file,item)=>{sent++;before+=file.size;after+=item.file.size;addLog(file.name+' — '+item.faces.length+' rosto(s) · '+(item.file.size/1024/1024).toFixed(2)+' MB'+(item.changed?' · reduzida '+Math.round((1-item.file.size/file.size)*100)+'%':' · original preservado'));update();},
- onError:(file,error)=>{failed++;addLog(file.name+' — '+error.message,true);update();}
- });}catch(error){setStatus('upload-status',error.message,true);}
- finally{uploading=false;$('batch-files').disabled=false;$('upload-quality').disabled=false;$('close-upload').disabled=false;}
- if(sent+failed===files.length){const saved=before?Math.round((1-after/before)*100):0;setStatus('upload-status','Lote concluído em '+Math.round((performance.now()-started)/1000)+'s: '+sent+' enviada(s), '+failed+' falha(s). Transferido '+(after/1024/1024).toFixed(1)+' MB · economia de '+saved+'%.',failed>0);}
+let batchQueue=null,batchStarted=0,batchEvent=null,batchMode='quality',batchWakeLock=null;
+const sizes=n=>(n/1024/1024).toFixed(1)+' MB';
+function batchUpdate(item){
+ if(!batchQueue)return;const c=batchQueue.counts,completed=c.done+c.failed+c.skipped;const elapsed=batchStarted?Math.max(1,(performance.now()-batchStarted)/1000):0;const remaining=c.total-completed;const eta=completed&&elapsed?Math.ceil(remaining*elapsed/completed/60):null;
+ $('upload-progress').hidden=false;$('upload-progress').max=c.total||1;$('upload-progress').value=completed;
+ const bytes=batchQueue.items.filter(i=>i.state==='done').reduce((s,i)=>s+(i.sentBytes||0),0);
+ $('batch-counts').textContent=c.total+' selecionadas · '+c.done+' enviadas · '+c.failed+' falhas · '+c.skipped+' sem rosto · '+remaining+' restantes';
+ $('batch-timing').textContent=(batchStarted?'Tempo: '+Math.floor(elapsed/60)+'min '+Math.floor(elapsed%60)+'s · ':'')+'Transferido: '+sizes(bytes)+(eta&&batchQueue.running?' · estimativa: ~'+eta+' min':'');
+ $('start-batch').disabled=uploading||batchQueue.running||!c.pending;$('pause-batch').hidden=!batchQueue.running;$('pause-batch').textContent=batchQueue.paused?'Continuar lote':'Pausar lote';$('cancel-batch').hidden=!batchQueue.running;$('retry-batch').hidden=batchQueue.running||!c.failed;
+ $('batch-files').disabled=uploading||batchQueue.running;$('batch-folder').disabled=uploading||batchQueue.running;$('upload-quality').disabled=uploading||batchQueue.running;$('batch-parallel').disabled=uploading||batchQueue.running;$('close-upload').disabled=uploading||batchQueue.running;
+ if(item&&['done','failed','skipped'].includes(item.state))addLog(item.file.name+' — '+(item.state==='done'?'enviada · '+sizes(item.sentBytes):item.error),item.state==='failed');
+ if(batchQueue.paused)setStatus('upload-status','Lote pausado. Os envios já iniciados podem terminar; clique em Continuar lote para retomar.');
+ else if(batchQueue.running)setStatus('upload-status',c.preparing?'Analisando a próxima foto; '+(c.uploading+c.retrying)+' envio(s) em andamento.':'Enviando fotos e preparando a fila…');
+ else if(batchStarted)setStatus('upload-status',c.pending?'Lote interrompido. Clique em Iniciar / continuar para enviar as restantes.':'Lote concluído. '+(c.failed?'Use Repetir falhas para tentar somente as que falharam.':''),c.failed>0);
+}
+function selectBatch(e){const files=Array.from(e.target.files);e.target.value='';if(!files.length||uploading)return;batchEvent=selectedEvent;batchStarted=0;$('upload-log').replaceChildren();
+ batchQueue=new BatchQueue(files.map(file=>({file,key:crypto.randomUUID(),state:'pending',sentBytes:0})),{
+ concurrency:3,onChange:batchUpdate,
+ prepare:async item=>{validateImage(item.file);const compressed=compressPhoto(item.file,batchMode);let faces;try{faces=await describe(item.file);}catch(e){await compressed;throw e;}const result=await compressed;if(!faces.length){const e=new Error('Nenhum rosto detectado; foto não enviada.');e.skip=true;throw e;}item.sentBytes=result.file.size;return {file:result.file,faces};},
+ upload:async(item,prepared)=>{const form=new FormData();form.append('file',prepared.file);form.append('descriptors',JSON.stringify(prepared.faces));form.append('upload_key',item.key);return api('/admin/events/'+batchEvent.id+'/photos','POST',form);}
+ });$('batch-controls').hidden=false;setStatus('upload-status','Lote preparado. Você pode selecionar mais de 500 fotos de uma vez. Clique em Iniciar / continuar.');batchUpdate();}
+$('batch-files').onchange=selectBatch;$('batch-folder').onchange=selectBatch;
+async function runBatch(retry=false){if(!batchQueue||batchQueue.running||uploading)return;if(!$('upload-consent').checked){setStatus('upload-status','Confirme a autorização antes de iniciar o lote.',true);return;}if(batchEvent.id!==selectedEvent.id){setStatus('upload-status','Selecione as fotos novamente para este evento.',true);return;}
+ uploading=true;batchMode=$('upload-quality').value;batchQueue.concurrency=Number($('batch-parallel').value);if(!batchStarted)batchStarted=performance.now();batchUpdate();setStatus('upload-status','Preparando reconhecimento facial… Na primeira vez, aguarde o carregamento dos modelos.');let timer,fatal;
+ try{await api('/auth/me');await loadModels();try{batchWakeLock=await navigator.wakeLock?.request('screen');}catch{}timer=setInterval(()=>batchUpdate(),1000);if(retry)await batchQueue.retryFailures();else await batchQueue.run();}
+ catch(error){fatal=error;}finally{clearInterval(timer);await batchWakeLock?.release().catch(()=>{});batchWakeLock=null;uploading=false;batchUpdate();if(fatal)setStatus('upload-status',fatal.message,true);}
  try{await renderAdminPhotos();}catch(error){setStatus('admin-status',error.message,true);}
-};
-function addLog(message,error=false){const li=document.createElement('li');li.textContent=message;if(error)li.className='error';$('upload-log').append(li);}
-async function renderAdminPhotos(){
- const photos=[];let page;do{page=await api('/admin/events/'+selectedEvent.id+'/photos?offset='+photos.length);photos.push(...page);}while(page.length===100);$('admin-photos').replaceChildren();
- if(!photos.length){$('admin-photos').textContent='Nenhuma foto enviada neste evento.';return;}
+}
+$('start-batch').onclick=()=>runBatch();$('retry-batch').onclick=()=>runBatch(true);$('pause-batch').onclick=()=>{if(batchQueue.paused)batchQueue.resume();else batchQueue.pause();};$('cancel-batch').onclick=()=>batchQueue.cancel();
+function addLog(message,error=false){const li=document.createElement('li');li.textContent=message;if(error)li.className='error';$('upload-log').append(li);while($('upload-log').children.length>100)$('upload-log').firstChild.remove();}
+let photoOffset=0;
+async function renderAdminPhotos(append=false){
+ const eventId=selectedEvent.id;if(!append){photoOffset=0;$('admin-photos').replaceChildren();}
+ $('load-more-photos').disabled=true;let photos;try{photos=await api('/admin/events/'+eventId+'/photos?offset='+photoOffset);}finally{$('load-more-photos').disabled=false;}
+ if(selectedEvent.id!==eventId)return;photoOffset+=photos.length;$('load-more-photos').hidden=photos.length<100;
+ if(!photos.length&&!append){$('admin-photos').textContent='Nenhuma foto enviada neste evento.';return;}
 
  for(let i=0;i<photos.length;i++){const p=photos[i];const card=document.createElement('article');card.className='result-photo';const img=document.createElement('img');img.src=p.url+'&thumb=1';img.alt=p.name;img.loading='lazy';const action=document.createElement('div');action.className='photo-actions';const label=document.createElement('span');label.textContent=p.name+' · '+p.face_count+' rosto(s)';const remove=document.createElement('button');remove.className='text-button';remove.textContent='Excluir';remove.onclick=async()=>{if(uploading||!confirm('Excluir esta foto e seus descritores? Esta ação não pode ser desfeita.'))return;remove.disabled=true;try{await api('/admin/photos/'+p.id,'DELETE');await renderAdminPhotos();}catch(e){setStatus('upload-status',e.message,true);remove.disabled=false;}};action.append(label,remove);card.append(img,action);$('admin-photos').append(card);}
 }
+$('load-more-photos').onclick=()=>renderAdminPhotos(true).catch(e=>setStatus('admin-status',e.message,true));
 window.addEventListener('beforeunload',e=>{if(uploading){e.preventDefault();e.returnValue='';}});
 async function init(){
  try{if(config.apiUrl){db=true;await loadEvents();}else throw new Error('Estamos preparando as galerias. Os eventos aparecerão aqui assim que a configuração for concluída.');}

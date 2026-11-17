@@ -1,0 +1,12 @@
+export class BatchQueue {
+ constructor(items,{prepare,upload,onChange=()=>{},concurrency=3,retries=2,sleep=ms=>new Promise(r=>setTimeout(r,ms))}){this.items=items;this.prepare=prepare;this.upload=upload;this.onChange=onChange;this.concurrency=Math.max(1,Math.min(4,concurrency));this.retries=retries;this.sleep=sleep;this.paused=false;this.cancelled=false;this.running=false;this.waiters=[];}
+ notify(item){this.onChange(item,this);}
+ pause(){this.paused=true;this.notify();}
+ resume(){this.paused=false;for(const resolve of this.waiters.splice(0))resolve();this.notify();}
+ cancel(){this.cancelled=true;this.resume();}
+ async gate(){while(this.paused&&!this.cancelled)await new Promise(r=>this.waiters.push(r));return !this.cancelled;}
+ async send(item,prepared){for(let attempt=0;;attempt++){try{item.state='uploading';item.attempt=attempt+1;this.notify(item);const result=await this.upload(item,prepared);item.state='done';item.result=result;item.error='';this.notify(item);return;}catch(e){const retryable=!!e.retryable||[408,429,502,503,504].includes(e.status);if(!retryable||attempt>=this.retries){item.state='failed';item.error=e.message;this.notify(item);return;}item.state='retrying';item.error=e.message;this.notify(item);await this.sleep(Math.min(30000,2000*2**attempt));if(!await this.gate()){item.state='pending';this.notify(item);return;}}}}
+ async run(){if(this.running)return;this.running=true;this.cancelled=false;const active=new Set();try{for(const item of this.items){if(item.state!=='pending')continue;if(!await this.gate())break;while(active.size>=this.concurrency){await Promise.race(active);if(!await this.gate())break;}if(this.cancelled)break;item.state='preparing';this.notify(item);let prepared;try{prepared=await this.prepare(item);}catch(e){item.state=e.skip?'skipped':'failed';item.error=e.message;this.notify(item);continue;}if(!await this.gate()){item.state='pending';this.notify(item);break;}const job=this.send(item,prepared);active.add(job);job.then(()=>active.delete(job));}await Promise.all(active);}finally{this.running=false;this.notify();}}
+ retryFailures(){if(this.running)return;for(const item of this.items)if(item.state==='failed'){item.state='pending';item.error='';}return this.run();}
+ get counts(){const result={total:this.items.length,pending:0,preparing:0,uploading:0,retrying:0,done:0,failed:0,skipped:0};for(const item of this.items)result[item.state]++;return result;}
+}

@@ -36,3 +36,11 @@ JPEG: alta qualidade (até 4000 px, qualidade do codificador 0,94), mais rápido
 ## Projeto original
 
 Fluxo facial adaptado de arifszn/find-me (MIT), commit 85e47be58c13d218aa48c158809ead4f609975f2. Licença e fonte original preservados no repositório.
+
+## Modo lote (500+ fotos)
+
+Selecione arquivos ou pasta inteira, confirme a autorização e pressione Iniciar / continuar. A fila não limita a seleção a 500 imagens e não carrega todas em memória: há uma preparação por vez e 2–4 envios em andamento. Controles: Pausar lote, Continuar lote, Interromper após os envios atuais e Repetir falhas. Falhas temporárias de rede recebem até duas novas tentativas automáticas. Cada item tem uma chave de envio, que evita duplicação no servidor quando uma resposta se perde. A chave vale para as repetições desse lote; selecionar os mesmos arquivos em um novo lote não é deduplicação por conteúdo.
+
+É necessário manter a aba aberta. Fechar/recarregar perde a fila não enviada; os arquivos confirmados permanecem na Oracle. A sessão dura 12 horas. Há limite de 15 MB por foto e o espaço livre do disco continua sendo o limite total. Fotos sem rostos detectados são marcadas como ignoradas. O registro visual mostra as 100 mensagens mais recentes, e os contadores incluem o lote inteiro. A grade carrega 100 fotos por página.
+
+Validação: node test-batch.mjs testa fila com 1001 itens simulados, concorrência, falhas, pausa e continuação. O teste backend/test_server.py envia 501 imagens sintéticas em banco temporário e verifica repetição idempotente e paginação. Isso não é benchmark de reconhecimento facial de 501 fotos reais.

@@ -7,7 +7,7 @@ from PIL import Image
 class API(unittest.TestCase):
  def setUp(self):
   with server.connect() as c:
-   for table in ['sessions','faces','photos','events','users','limits','settings']:c.execute('DELETE FROM '+table)
+   for table in ['upload_receipts','sessions','faces','photos','events','users','limits','settings']:c.execute('DELETE FROM '+table)
    c.execute('INSERT INTO users VALUES(?,?,?)',('qa','qa@example.invalid',server.password_hash('test-password-123')))
   self.client=TestClient(server.app)
   r=self.client.post('/api/auth/login',json={'email':'qa@example.invalid','password':'test-password-123'});self.assertEqual(r.status_code,200);self.headers={'Authorization':'Bearer '+r.json()['token']}
@@ -46,4 +46,19 @@ class API(unittest.TestCase):
   event=self.event()
   r=self.client.post('/api/admin/events/'+event+'/photos',headers=self.headers,files={'file':('x.png',b'not an image','image/png')},data={'descriptors':server.json.dumps([[.1]*128])});self.assertEqual(r.status_code,400)
   with server.connect() as c:self.assertEqual(c.execute('SELECT count(*) FROM photos').fetchone()[0],0)
+ def test_large_batch_and_idempotency(self):
+  import uuid,concurrent.futures
+  event=self.event();buf=io.BytesIO();Image.new('RGB',(20,20),'blue').save(buf,format='PNG');payload=buf.getvalue();descriptor=server.json.dumps([[.1]*128])
+  def send(key):return self.client.post('/api/admin/events/'+event+'/photos',headers=self.headers,files={'file':('batch.png',payload,'image/png')},data={'descriptors':descriptor,'upload_key':key})
+  keys=[str(uuid.uuid4()) for _ in range(501)]
+  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+   results=list(pool.map(send,keys))
+  self.assertTrue(all(r.status_code==200 for r in results))
+  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+   duplicates=list(pool.map(send,[keys[0]]*4))
+  self.assertTrue(all(r.status_code==200 and r.json()['reused'] for r in duplicates))
+  self.assertEqual(len({r.json()['id'] for r in duplicates}),1)
+  with server.connect() as c:self.assertEqual(c.execute('SELECT count(*) FROM photos').fetchone()[0],501)
+  first=self.client.get('/api/admin/events/'+event+'/photos',headers=self.headers).json();last=self.client.get('/api/admin/events/'+event+'/photos?offset=500',headers=self.headers).json();self.assertEqual(len(first),100);self.assertEqual(len(last),1)
+  self.assertEqual(send('invalid-key').status_code,400)
 if __name__=='__main__':unittest.main(verbosity=2)

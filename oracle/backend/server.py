@@ -13,6 +13,7 @@ PHOTOS=DATA/'photos'; PHOTOS.mkdir(exist_ok=True)
 THUMBS=DATA/'thumbs'; THUMBS.mkdir(exist_ok=True)
 SECRET=os.environ['LUME_SECRET'].encode(); BASE=os.environ.get('PUBLIC_URL','https://lume.163.176.48.125.sslip.io')
 LOCK=threading.RLock()
+UPLOAD_LOCK=threading.Lock()
 @contextmanager
 def connect():
  c=sqlite3.connect(DATA/'lume.sqlite',timeout=30); c.row_factory=sqlite3.Row;c.execute('PRAGMA foreign_keys=ON')
@@ -26,6 +27,7 @@ with connect() as c:
  CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,name TEXT NOT NULL,slug TEXT UNIQUE,event_date TEXT,published INTEGER DEFAULT 0,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
  CREATE TABLE IF NOT EXISTS photos(id TEXT PRIMARY KEY,event_id TEXT REFERENCES events(id) ON DELETE CASCADE,name TEXT,path TEXT UNIQUE,face_count INTEGER,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
  CREATE TABLE IF NOT EXISTS faces(id INTEGER PRIMARY KEY,photo_id TEXT REFERENCES photos(id) ON DELETE CASCADE,event_id TEXT REFERENCES events(id) ON DELETE CASCADE,descriptor BLOB);
+ CREATE TABLE IF NOT EXISTS upload_receipts(user_id TEXT NOT NULL,event_id TEXT NOT NULL,upload_key TEXT NOT NULL,photo_id TEXT NOT NULL REFERENCES photos(id) ON DELETE CASCADE,PRIMARY KEY(user_id,event_id,upload_key));
  CREATE INDEX IF NOT EXISTS faces_event ON faces(event_id);
  CREATE INDEX IF NOT EXISTS photos_event ON photos(event_id);
  CREATE TABLE IF NOT EXISTS limits(key TEXT PRIMARY KEY,window INTEGER,n INTEGER);
@@ -156,7 +158,10 @@ def list_photos(event:str,offset:int=0,user=Depends(admin)):
  with connect() as c:rows=[dict(r) for r in c.execute('SELECT * FROM photos WHERE event_id=? ORDER BY created_at DESC,id LIMIT 100 OFFSET ?',(event,offset))]
  return [{**p,'url':photo_url(p)} for p in rows]
 @app.post('/api/admin/events/{event}/photos')
-def upload(event:str,file:UploadFile=File(...),descriptors:str=Form(...),user=Depends(admin)):
+def upload(event:str,file:UploadFile=File(...),descriptors:str=Form(...),upload_key:str|None=Form(None),user=Depends(admin)):
+ if upload_key is not None:
+  try:uuid.UUID(upload_key)
+  except (ValueError,AttributeError):raise HTTPException(400,'Identificador de envio inválido.')
  try:values=json.loads(descriptors)
  except ValueError:raise HTTPException(400,'Descritores inválidos.')
  if not isinstance(values,list) or not 1<=len(values)<=100:raise HTTPException(400,'Quantidade de rostos inválida.')
@@ -170,13 +175,18 @@ def upload(event:str,file:UploadFile=File(...),descriptors:str=Form(...),user=De
   if image.format not in ['JPEG','PNG','WEBP']:raise ValueError()
  except Exception:raise HTTPException(400,'Imagem inválida. Use JPG, PNG ou WebP.')
  if shutil.disk_usage(DATA).free<len(content)+2*1024**3:raise HTTPException(507,'Disco quase cheio.')
- id=str(uuid.uuid4());target=PHOTOS/id;target.write_bytes(content)
- try:
-  with connect() as c:
-   c.execute('INSERT INTO photos(id,event_id,name,path,face_count) VALUES(?,?,?,?,?)',(id,event,(file.filename or 'foto')[:255],id,len(values)))
-   c.executemany('INSERT INTO faces(photo_id,event_id,descriptor) VALUES(?,?,?)',[(id,event,v.tobytes()) for v in vectors])
- except:target.unlink(missing_ok=True);raise
- return {'id':id,'face_count':len(values)}
+ with UPLOAD_LOCK:
+  if upload_key:
+   with connect() as c:prior=c.execute('SELECT p.id,p.face_count FROM upload_receipts r JOIN photos p ON p.id=r.photo_id WHERE r.user_id=? AND r.event_id=? AND r.upload_key=?',(user['id'],event,upload_key)).fetchone()
+   if prior:return {'id':prior['id'],'face_count':prior['face_count'],'reused':True}
+  id=str(uuid.uuid4());target=PHOTOS/id;target.write_bytes(content)
+  try:
+   with connect() as c:
+    c.execute('INSERT INTO photos(id,event_id,name,path,face_count) VALUES(?,?,?,?,?)',(id,event,(file.filename or 'foto')[:255],id,len(values)))
+    c.executemany('INSERT INTO faces(photo_id,event_id,descriptor) VALUES(?,?,?)',[(id,event,v.tobytes()) for v in vectors])
+    if upload_key:c.execute('INSERT INTO upload_receipts VALUES(?,?,?,?)',(user['id'],event,upload_key,id))
+  except:target.unlink(missing_ok=True);raise
+ return {'id':id,'face_count':len(values),'reused':False}
 @app.delete('/api/admin/photos/{id}')
 def delete_photo(id:str,user=Depends(admin)):
  with connect() as c:
