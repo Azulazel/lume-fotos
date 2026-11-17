@@ -1,0 +1,8 @@
+[Unit]
+Description=Lume SQLite snapshot
+[Service]
+Type=oneshot
+User=lume
+Group=lume
+ExecStart=/opt/lume/venv/bin/python /opt/lume/backend/backup.py
+UMask=0077
