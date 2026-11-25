@@ -55,7 +55,7 @@ $('event-select').onchange=clearSearch;
 $('consent').onchange=()=>{if(!$('consent').checked)clearSearch();};
 $('select-selfie').onclick=()=>{try{readyForSearch();$('selfie-file').click();}catch(e){setStatus('search-status',e.message,true);}};
 $('selfie-file').onchange=async e=>{const file=e.target.files[0];if(file)await search(file);e.target.value='';};
-async function search(file) {
+async function search(file, references = null) {
   if(searching)return;
   clearSearch();const generation=searchGeneration; const eventSlug=$('event-select').value;
   searching=true; $('select-selfie').disabled=true;$('open-camera').disabled=true;
@@ -63,11 +63,18 @@ async function search(file) {
     readyForSearch(); validateImage(file);
     selfieUrl=URL.createObjectURL(file);$('selfie-preview').src=selfieUrl;$('selfie-preview').hidden=false;$('selfie-placeholder').hidden=true;$('clear-search').hidden=false;
     setStatus('search-status','Preparando a busca… Na primeira vez, os modelos podem levar alguns segundos para carregar.');
-    const faces=await describe(file);
+    const faces=references || await describe(file);
     if(generation!==searchGeneration)return;
-    if(faces.length!==1)throw new Error(faces.length?'Encontramos mais de um rosto. Escolha uma foto apenas sua.':'Não encontramos um rosto nítido. Tente outra foto, de frente e com boa iluminação.');
+    if(!references && faces.length!==1)throw new Error(faces.length?'Encontramos mais de um rosto. Escolha uma foto apenas sua.':'Não encontramos um rosto nítido. Tente outra foto, de frente e com boa iluminação.');
     setStatus('search-status','Procurando você nas fotos do evento…');
-    const data=await api('/search','POST',{event:eventSlug,descriptor:faces[0]});const error=null;
+    const matches=new Map();
+    for (let i=0;i<faces.length;i++){
+      if(generation!==searchGeneration)return;
+      setStatus('search-status','Buscando com a referência '+(i+1)+' de '+faces.length+'…');
+      const result=await api('/search','POST',{event:eventSlug,descriptor:faces[i]});
+      for(const photo of result.photos||[])matches.set(photo.id,photo);
+    }
+    const data={photos:[...matches.values()]};const error=null;
     if(generation!==searchGeneration)return;
     if(error)throw new Error('Não foi possível concluir a busca. Aguarde um minuto e tente novamente.');
     if(data.error)throw new Error(data.error);
@@ -88,17 +95,61 @@ function renderResults(photos) {
   }
   $('results').scrollIntoView({behavior:'smooth',block:'start'});
 }
-function stopCamera(){if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;$('camera-video').srcObject=null;}
+
+let cameraSession=0,cameraShots=[],cameraDescriptors=[],cameraBusy=false;
+const cameraSteps=[
+ ['Olhe de frente','Posicione seu rosto dentro da moldura, em um local iluminado. Você pode sorrir naturalmente.','Capturar de frente'],
+ ['Vire levemente para a sua esquerda','Mantenha os dois olhos visíveis. Não precisa ficar de perfil.','Capturar à esquerda'],
+ ['Vire levemente para a sua direita','Mantenha o rosto dentro da moldura e os dois olhos visíveis.','Capturar à direita']
+];
+function updateCameraStep(){
+ const step=cameraShots.length,guide=cameraSteps[step];
+ $('camera-step').textContent='Foto '+(step+1)+' de 3';
+ $('camera-instruction').textContent=guide[0];$('camera-hint').textContent=guide[1];
+ $('capture').textContent=guide[2];$('camera-frame').dataset.step=String(step);
+}
+function stopCamera(){
+ cameraSession++;if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;
+ $('camera-video').srcObject=null;cameraShots=[];cameraDescriptors=[];cameraBusy=false;
+}
 $('open-camera').onclick=async()=>{
- try{readyForSearch();if(!navigator.mediaDevices?.getUserMedia)throw new Error('A câmera não está disponível. Escolha uma foto da galeria.');
+ if($('camera-dialog').open)return;
+ const session=++cameraSession;cameraShots=[];cameraDescriptors=[];updateCameraStep();
+ try{
+ readyForSearch();if(!navigator.mediaDevices?.getUserMedia)throw new Error('A câmera não está disponível. Escolha uma foto da galeria.');
  $('camera-dialog').showModal();$('capture').disabled=true;setStatus('camera-status','Solicitando acesso à câmera…');
- stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:900}},audio:false});
- if(!$('camera-dialog').open){stopCamera();return;}
- $('camera-video').srcObject=stream;await $('camera-video').play();$('capture').disabled=false;setStatus('camera-status','');
- }catch(e){stopCamera();if($('camera-dialog').open)$('camera-dialog').close();setStatus('search-status',e.name==='NotAllowedError'?'Acesso à câmera não autorizado. Você pode selecionar uma foto da galeria.':e.message,true);}
+ const incoming=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280}},audio:false});
+ if(session!==cameraSession||!$('camera-dialog').open){incoming.getTracks().forEach(t=>t.stop());return;}
+ stream=incoming;$('camera-video').srcObject=stream;await $('camera-video').play();
+ setStatus('camera-status','Preparando reconhecimento facial…');await loadModels();
+ if(session!==cameraSession)return;
+ $('capture').disabled=false;setStatus('camera-status','Ajuste a posição e toque no botão para capturar.');
+ }catch(e){if(session!==cameraSession)return;stopCamera();if($('camera-dialog').open)$('camera-dialog').close();setStatus('search-status',e.name==='NotAllowedError'?'Acesso à câmera não autorizado. Você pode selecionar uma foto da galeria.':e.message,true);}
 };
-$('close-camera').onclick=()=>{$('camera-dialog').close();stopCamera();};$('camera-dialog').addEventListener('close',stopCamera);
-$('capture').onclick=async()=>{const v=$('camera-video');if(!v.videoWidth)return;const c=document.createElement('canvas');c.width=v.videoWidth;c.height=v.videoHeight;c.getContext('2d').drawImage(v,0,0);const blob=await new Promise(resolve=>c.toBlob(resolve,'image/jpeg',.92));stopCamera();$('camera-dialog').close();if(blob)await search(new File([blob],'selfie.jpg',{type:'image/jpeg'}));};
+$('close-camera').onclick=()=>{$('camera-dialog').close();stopCamera();};
+$('camera-dialog').addEventListener('close',stopCamera);
+$('capture').onclick=async()=>{
+ if(cameraBusy)return;const v=$('camera-video');if(!v.videoWidth)return;
+ const session=cameraSession;cameraBusy=true;$('capture').disabled=true;
+ const canvas=document.createElement('canvas');canvas.width=v.videoWidth;canvas.height=v.videoHeight;
+ try{
+ canvas.getContext('2d').drawImage(v,0,0);setStatus('camera-status','Conferindo sua captura…');
+ const faces=await faceapi.detectAllFaces(canvas,new faceapi.SsdMobilenetv1Options({minConfidence:.5})).withFaceLandmarks().withFaceDescriptors();
+ if(session!==cameraSession)return;
+ if(faces.length!==1)throw new Error(faces.length?'Deixe somente o seu rosto na câmera.':'Não consegui detectar o rosto. Vire um pouco menos e procure boa iluminação.');
+ const box=faces[0].detection.box;
+ if(box.width/canvas.width<.18||box.height/canvas.height<.22)throw new Error('Aproxime um pouco o rosto da câmera e tente novamente.');
+ const blob=await new Promise(resolve=>canvas.toBlob(resolve,'image/jpeg',.94));
+ if(session!==cameraSession)return;if(!blob)throw new Error('Não foi possível capturar. Tente novamente.');
+ cameraShots.push(new File([blob],'selfie-'+cameraShots.length+'.jpg',{type:'image/jpeg'}));
+ cameraDescriptors.push(Array.from(faces[0].descriptor));
+ if(cameraShots.length===3){
+ const preview=cameraShots[0],references=cameraDescriptors.slice();
+ stopCamera();$('camera-dialog').close();await search(preview,references);
+ }else{updateCameraStep();setStatus('camera-status','Foto anterior capturada. Ajuste a posição para a próxima.');}
+ }catch(e){if(session===cameraSession)setStatus('camera-status',e.message,true);}
+ finally{canvas.width=0;canvas.height=0;if(session===cameraSession){cameraBusy=false;$('capture').disabled=false;}}
+};
 window.addEventListener('pagehide',()=>{stopCamera();clearSearch();});
 $('login-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;try{setStatus('login-status','Entrando…');setStatus('login-status','Entrando…');const result=await api('/auth/login','POST',{email:$('email').value.trim(),password:$('password').value});authToken=result.token;sessionStorage.setItem('lume-oracle-token',authToken);$('password').value='';await refreshAdmin();}catch(e){setStatus('login-status',e.message,true);}finally{button.disabled=false;}};
 async function refreshAdmin(){
